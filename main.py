@@ -7,9 +7,13 @@ import numpy as np
 import time
 import re
 import pyttsx3 
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+import torch
+
 
 GREEN =  '\033[32m' # Green Text
 WHITE = '\033[37m' # white text 
+model_path = "D:\\PersonalProjs\\NLP With LLM\\fine tuning speech to text\\results"
 
 # List of placeholder phrases to filter
 PLACEHOLDER_STRINGS = [
@@ -86,15 +90,16 @@ def filter_transcription(text):
     Returns:
         str: Cleaned transcription.
     """
+    
+    # Remove any non-alphanumeric sequences like double spaces
+    text = re.sub(r"[^a-zA-Z0-9\s.,!?']", "", text)
+
     # Remove placeholder strings
     for placeholder in PLACEHOLDER_STRINGS:
         text = text.replace(placeholder, "")
-
-    # Optional: Remove any non-alphanumeric sequences like double spaces
-    text = re.sub(r'\s+', ' ', text).strip()
     
     # Return cleaned text
-    return text
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 
@@ -124,13 +129,68 @@ def transcribe_chunk(model, file_path):
         return "[Transcription failed]"
     
 
+def process_audio(frames, processor, model, device):
+    """
+    Process and transcribe audio frames using WhisperProcessor and WhisperForConditionalGeneration.
 
-def record_until_trigger(p, stream, model, trigger_phrase="alpha"):
+    Args:
+        frames (list): List of audio frames (NumPy arrays).
+        processor (WhisperProcessor): Whisper processor for feature extraction.
+        model (WhisperForConditionalGeneration): Whisper model for transcription.
+        device (torch.device): Device to run the model on.
+
+    Returns:
+        str: Transcribed text from the audio.
+    """
+    # Merge and normalize audio frames
+    audio_data = np.concatenate(frames, axis=0).astype(np.float32)
+    audio_data = audio_data / np.max(np.abs(audio_data))  # Normalize to -1 to 1
+
+    # Extract mel spectrogram features
+    inputs = processor.feature_extractor(
+        audio_data,
+        sampling_rate=16000,
+        return_tensors="pt"
+    )
+
+    # Extract mel features and pad explicitly to 3000
+    input_features = inputs.input_features.to(device)
+    mel_length = input_features.size(-1)
+    
+    if mel_length < 3000:
+        pad_length = 3000 - mel_length
+        input_features = torch.nn.functional.pad(
+            input_features,
+            (0, pad_length),
+            value=processor.feature_extractor.padding_value
+        )
+    elif mel_length > 3000:
+        input_features = input_features[:, :, :3000]  # Truncate to 3000 if larger
+    attention_mask = (input_features != processor.feature_extractor.padding_value).long()
+
+
+    # Generate transcription using the model
+    with torch.no_grad():
+        # forced_language_ids = processor.tokenizer.get_lang_id("en")
+        if attention_mask is not None:
+            predicted_ids = model.generate(input_features, attention_mask=attention_mask, pad_token_id=processor.tokenizer.pad_token_id)
+        else:
+            predicted_ids = model.generate(input_features, pad_token_id=processor.tokenizer.pad_token_id)
+        transcription = processor.tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+
+    filtered_transcription = filter_transcription(transcription)
+    
+    return filtered_transcription
+
+
+
+def record_until_trigger(p, stream, processor, model, trigger_phrase="finish"):
     """
     Continuously records audio and transcribes it, sending data to LLM when the trigger phrase is spoken.
     """
     frames = []
-    accumulated_transcript = ""  # Accumulates text between responses
+    accumulated_transcript = ""  
+    device = model.device
 
     print(GREEN + "Recording... (say '" + trigger_phrase + "' to process)" + WHITE)
 
@@ -138,21 +198,13 @@ def record_until_trigger(p, stream, model, trigger_phrase="alpha"):
         try:
             # Continuously read audio data
             data = stream.read(1024, exception_on_overflow=False)
-            frames.append(data)
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            frames.append(audio_data)
 
             # Check if data is silent; process audio if sufficient length
             if len(frames) > 50:  # Adjust this buffer size as needed
-                file_path = "temp_chunk.wav"
-                with wave.open(file_path, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
-                    wf.setframerate(16000)
-                    wf.writeframes(b''.join(frames))
-                frames = []  # Reset the audio frame buffer
-
-                # Transcribe the audio chunk
-                transcription = transcribe_chunk(model, file_path)
-                os.remove(file_path)  # Clean up temp file
+                transcription = process_audio(frames, processor, model, device)
+                frames = []  # Reset the frame buffer
 
                 if transcription.strip():
                     print(GREEN + "You said: " + transcription + WHITE)
@@ -181,37 +233,21 @@ def speak_text(text):
 
 
 def main():
-    model_size = "medium.en"
-    model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    # model_size = "medium.en"
+    # model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    model = WhisperForConditionalGeneration.from_pretrained(model_path)
+    processor = WhisperProcessor.from_pretrained(model_path)
+
+    # Set the model to evaluation mode
+    model.eval()
+    model.to("cuda" if torch.cuda.is_available() else "cpu")
+
     p = pyaudio.PyAudio()
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
-    accumulated_transcript = ""
-
-    # try:
-    #     while True:
-    #         chunk_file = "temp_chunk.wav"
-    #         if record_chunk(p, stream, chunk_file, silence_duration=2):
-    #             transcription = transcribe_chunk(model, chunk_file)
-    #             os.remove(chunk_file)
-
-    #             if transcription.strip():
-    #                 print(GREEN + "You said: " + transcription + WHITE)
-
-    #                 if "You can answer now." in transcription:
-    #                     response = query_handler.generate_response(transcription)
-    #                     print(GREEN + "Llama3 Response: " + response + WHITE)
-    #                     accumulated_transcript = ""
-
-    #                 else:
-    #                     accumulated_transcript += transcription + " "
-
-    # except KeyboardInterrupt:
-    #     print("Stopping...")
-    #     with open("log.txt", "w") as log_file:
-    #         log_file.write(accumulated_transcript)
+    # accumulated_transcript = ""
 
     try:
-        record_until_trigger(p, stream, model)
+        record_until_trigger(p, stream, processor, model)
 
     finally:
         print("Cleaning up resources...")
